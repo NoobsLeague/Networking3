@@ -5,7 +5,6 @@ using System.Collections.Generic;
 using System.Threading;
 using shared;
 
-
 class TCPServerSample
 {
     private TcpListener _listener;
@@ -51,15 +50,23 @@ class TCPServerSample
             float z = (float)(Math.Sin(angle) * distance);
             float y = 0;
 
-            var avatar = new AvatarInfo(id, skin, x, y ,z);
+            var avatar = new AvatarInfo(id, skin, x, y, z);
             _clientAvatars[client] = avatar;
             Console.WriteLine($"Client {id} connected.");
 
             var assign = new ClientIdSerilizer(id);
             var pAssign = new Packet();
             pAssign.Write(assign);
-            StreamUtil.Write(client.GetStream(), pAssign.GetBytes());
 
+            // Safe send for new client assignment
+            if (!SafeSendToClient(client, pAssign.GetBytes()))
+            {
+                // If we can't even send the initial assignment, disconnect immediately
+                DisconnectClient(client);
+                return;
+            }
+
+            // Send full avatar list to everyone when new client connects
             BroadcastAvatarList();
         }
     }
@@ -72,8 +79,9 @@ class TCPServerSample
             try
             {
                 var sock = client.Client;
-                // TODO (maybe): uncomment this:
-                if (sock.Poll(0, SelectMode.SelectRead) && sock.Available == 0)
+
+                // Enhanced disconnection detection
+                if (!IsClientConnected(client))
                 {
                     DisconnectClient(client);
                     continue;
@@ -112,6 +120,96 @@ class TCPServerSample
         }
     }
 
+    // Enhanced connection checking
+    private bool IsClientConnected(TcpClient client)
+    {
+        try
+        {
+            if (client == null || !client.Connected)
+                return false;
+
+            var sock = client.Client;
+
+            // Poll for connection status
+            if (sock.Poll(0, SelectMode.SelectRead) && sock.Available == 0)
+                return false;
+
+            // Additional check: try to peek at the socket
+            if (sock.Poll(0, SelectMode.SelectError))
+                return false;
+
+            return true;
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
+    // Safe method to send data to a specific client with error handling
+    private bool SafeSendToClient(TcpClient client, byte[] data)
+    {
+        try
+        {
+            if (!IsClientConnected(client))
+                return false;
+
+            StreamUtil.Write(client.GetStream(), data);
+            return true;
+        }
+        catch (Exception e)
+        {
+            Console.WriteLine($"Failed to send to client: {e.Message}");
+            return false;
+        }
+    }
+
+    private void BroadcastAvatarList()
+    {
+        var msg = new AvatarList(new List<AvatarInfo>(_clientAvatars.Values));
+        var packet = new Packet();
+        packet.Write(msg);
+        var bytes = packet.GetBytes();
+
+        // Keep track of clients to disconnect due to send failures
+        var clientsToDisconnect = new List<TcpClient>();
+
+        foreach (var client in _clients)
+        {
+            if (!SafeSendToClient(client, bytes))
+            {
+                clientsToDisconnect.Add(client);
+            }
+        }
+
+        // Disconnect failed clients
+        foreach (var client in clientsToDisconnect)
+        {
+            DisconnectClient(client);
+        }
+    }
+
+    // IMPROVED: Safe broadcast for chat messages
+    private void SafeBroadcastToClients(byte[] data, List<TcpClient> targetClients = null)
+    {
+        var targets = targetClients ?? _clients;
+        var clientsToDisconnect = new List<TcpClient>();
+
+        foreach (var client in targets)
+        {
+            if (!SafeSendToClient(client, data))
+            {
+                clientsToDisconnect.Add(client);
+            }
+        }
+
+        // Disconnect failed clients
+        foreach (var client in clientsToDisconnect)
+        {
+            DisconnectClient(client);
+        }
+    }
+
     private void HandleChatRequest(TcpClient client, CommandSerilizer creq)
     {
         if (!_clientAvatars.TryGetValue(client, out var avatar)) return;
@@ -131,23 +229,28 @@ class TCPServerSample
         pChat.Write(chat);
         var bytes = pChat.GetBytes();
 
-        //whisper
         if (whisper)
         {
+            // Build list of clients in whisper range
+            var whisperTargets = new List<TcpClient>();
+
             foreach (var other in _clients)
             {
                 if (_clientAvatars.TryGetValue(other, out var o))
                 {
                     float dx = o.x - avatar.x, dz = o.z - avatar.z;
                     if (Math.Sqrt(dx * dx + dz * dz) <= WhisperRange)
-                        StreamUtil.Write(other.GetStream(), bytes);
+                        whisperTargets.Add(other);
                 }
             }
+
+            // Use safe broadcast for whisper
+            SafeBroadcastToClients(bytes, whisperTargets);
         }
         else
         {
-            foreach (var c in _clients)
-                StreamUtil.Write(c.GetStream(), bytes);
+            // Use safe broadcast for normal chat
+            SafeBroadcastToClients(bytes);
         }
     }
 
@@ -184,21 +287,20 @@ class TCPServerSample
 
         _clients.Remove(client);
         _clientAvatars.Remove(client);
-        client.Close();
-        BroadcastAvatarList();
-    }
 
-    private void BroadcastAvatarList()
-    {
-        var msg = new AvatarList(new List<AvatarInfo>(_clientAvatars.Values));
-        var packet = new Packet();
-        packet.Write(msg);
-        var bytes = packet.GetBytes();
+        try
+        {
+            client.Close();
+        }
+        catch (Exception e)
+        {
+            Console.WriteLine($"Error closing client connection: {e.Message}");
+        }
 
-        foreach (var c in _clients)
-            StreamUtil.Write(c.GetStream(), bytes);
+        // Send full avatar list when someone disconnects
+        if (avatar != null)
+        {
+            BroadcastAvatarList();
+        }
     }
 }
-// in BroadcastAvatarList:
-// What happens if client 3 is disconnected (and polling hasn't detected it yet)
-//  what will client 2 and 4 see?
